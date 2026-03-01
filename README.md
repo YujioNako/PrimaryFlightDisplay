@@ -1,6 +1,8 @@
 # PrimaryFlightDisplay
 A Primary Flight Display simulator based on ESP32
 
+<big><b>声明：本程序及硬件组装方式中含有AI生成内容，本人不保证这些内容能在任何地方正确工作，请您知悉！</b></big> 
+
 ## 需要模块
 |模块型号|模块用途|
 | ------- | ------- |
