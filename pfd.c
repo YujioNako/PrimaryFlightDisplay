@@ -33,14 +33,69 @@ bool forceRedraw = true;
 bool bno_alive = false; bool bmp_alive = false; bool gps_alive = false;
 bool show_alt_err = false; 
 
+#define RGB_TO_BGR(r, g, b) tft.color565(b, g, r)
+#define A_SKY    RGB_TO_BGR(30, 144, 255)
+#define A_BROWN  RGB_TO_BGR(150, 75, 0)
+#define A_GREEN  RGB_TO_BGR(0, 255, 0)
+#define A_CYAN   RGB_TO_BGR(0, 255, 255)
+#define A_YELLOW RGB_TO_BGR(255, 255, 0)
+#define A_AMBER  RGB_TO_BGR(255, 153, 0)  
+#define A_RED    RGB_TO_BGR(255, 0, 0)
+#define A_WHITE  0xFFFF
+#define A_BLACK  0x0000
+#define A_GREY   RGB_TO_BGR(100, 100, 100)
+
 // ==========================================
-// 纯软件向量映射矩阵 
+// 🚨 V36.0 基于硬件 BUSY 引脚的 EGPWS 结构
 // ==========================================
-int mapX = 0, sgnX = 1; // 右机翼轴
-int mapY = 1, sgnY = 1; // 飞机机鼻轴
-int mapZ = 2, sgnZ = 1; // 天地重力轴
-bool inv_hdg = false;   // 航向反转补偿
-int cal_map_Z = 2, cal_sign_Z = 1; // 标定中转变量
+// 设定连接 DFPlayer BUSY 引脚的 ESP32 端口
+#define DF_BUSY_PIN 32 
+
+struct WarningFlag {
+  const char* menu_name; 
+  bool active;           
+  bool show_on_pfd;      
+  uint8_t track_id;      
+  uint16_t pfd_color;    
+  const char* pfd_text;  
+  uint8_t level;         // 优先级 (1=致命, 2=警告, 3=提示)
+  // 彻底删除了 duration_ms，再也不用手动猜时长了！
+};
+
+#define NUM_WARNINGS 14
+WarningFlag warnings[NUM_WARNINGS] = {
+  {"PULL UP",   false, true,  1,  A_RED,   "PULL UP",    1}, 
+  {"TERRAIN",   false, true,  2,  A_RED,   "TERR AHEAD", 1},
+  {"OBSTACLE",  false, true,  3,  A_RED,   "OBST AHEAD", 1},
+  {"W/SHEAR",   false, true,  4,  A_RED,   "WINDSHEAR",  1},
+  {"OVERSPEED", false, true,  14, A_RED,   "OVERSPEED",  1}, 
+  {"SINK RATE", false, true,  5,  A_AMBER, "SINK RATE",  2},
+  {"G/S",       false, true,  6,  A_AMBER, "GLIDESLOPE", 2},
+  {"LOW SPEED", false, true,  7,  A_AMBER, "LOW SPEED",  2},
+  {"DONT SINK", false, false, 8,  0,       "",           3},
+  {"LOW TERR",  false, false, 9,  0,       "",           3},
+  {"LOW GEAR",  false, false, 10, 0,       "",           3},
+  {"LOW FLAP",  false, false, 11, 0,       "",           3},
+  {"BANK ANGL", false, false, 12, 0,       "",           3},
+  {"MINIMUMS",  false, false, 13, 0,       "",           3}
+};
+
+int audio_style = 0; 
+
+// 🌟 全新硬件状态机变量
+enum AudioState { A_IDLE, A_PLAYING, A_WAITING };
+AudioState audio_state = A_IDLE;
+unsigned long wait_start_time = 0;
+unsigned long play_start_time = 0; // 防延迟防抖
+int current_round_robin_idx = 0;  
+int last_played_level = 99;       
+int current_playing_idx = -1;     
+
+int mapX = 0, sgnX = 1; 
+int mapY = 1, sgnY = 1; 
+int mapZ = 2, sgnZ = 1; 
+bool inv_hdg = false;   
+int cal_map_Z = 2, cal_sign_Z = 1; 
 
 float raw_pitch = 0.0, raw_roll = 0.0, raw_heading = 0.0;
 float pitch_cal = 0.0, roll_cal = 0.0, hdg_cal = 0.0; 
@@ -55,27 +110,12 @@ int v_mode = 1; float target_alt = 10000.0; float target_vs = 1000.0;
 bool en_hdg = true; float target_hdg = 360.0; 
 int audio_volume = 20; 
 
-bool faults[4] = {false, false, false, false};
-const char* fault_names[4] = {"PULL UP", "TERR AHEAD", "STALL", "OVERSPEED"};
-
 volatile int encoderPos = 0; volatile bool buttonPressed = false;
 unsigned long lastButtonPress = 0;
 int currentMenuSelection = 0; int lastMenuSelection = -1; 
 int savedMenuPos = 0; int lastMenuEncoderPos = -999; 
 int menuScrollOffset = 0;
 const int MAX_VISIBLE_ITEMS = 6;
-
-#define RGB_TO_BGR(r, g, b) tft.color565(b, g, r)
-#define A_SKY    RGB_TO_BGR(30, 144, 255)
-#define A_BROWN  RGB_TO_BGR(150, 75, 0)
-#define A_GREEN  RGB_TO_BGR(0, 255, 0)
-#define A_CYAN   RGB_TO_BGR(0, 255, 255)
-#define A_YELLOW RGB_TO_BGR(255, 255, 0)
-#define A_AMBER  RGB_TO_BGR(255, 153, 0)  
-#define A_RED    RGB_TO_BGR(255, 0, 0)
-#define A_WHITE  0xFFFF
-#define A_BLACK  0x0000
-#define A_GREY   RGB_TO_BGR(100, 100, 100)
 
 void IRAM_ATTR encoderISR() {
   static uint8_t old_AB = 0; static int8_t encval = 0;
@@ -92,10 +132,18 @@ void IRAM_ATTR buttonISR() {
 const byte UBLOX_5HZ[] = {0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00, 0xDE, 0x6A};
 
 void playWarningAudio(uint8_t track) {
-  uint16_t sum = -(0xFF + 0x06 + 0x03 + 0x00 + 0x00 + track);
-  byte playCmd[10] = {0x7E, 0xFF, 0x06, 0x03, 0x00, 0x00, track, (byte)(sum >> 8), (byte)(sum & 0xFF), 0xEF};
+  uint8_t folder = (audio_style == 0) ? 1 : 2; 
+  uint16_t sum = -(0xFF + 0x06 + 0x0F + 0x00 + folder + track);
+  byte playCmd[10] = {0x7E, 0xFF, 0x06, 0x0F, 0x00, folder, track, (byte)(sum >> 8), (byte)(sum & 0xFF), 0xEF};
   Audio_Serial.write(playCmd, 10);
 }
+
+void stopAudio() {
+  uint16_t sum = -(0xFF + 0x06 + 0x16 + 0x00 + 0x00 + 0x00);
+  byte stopCmd[10] = {0x7E, 0xFF, 0x06, 0x16, 0x00, 0x00, 0x00, (byte)(sum >> 8), (byte)(sum & 0xFF), 0xEF};
+  Audio_Serial.write(stopCmd, 10);
+}
+
 void setAudioVolume(uint8_t vol) {
   uint16_t sum = -(0xFF + 0x06 + 0x06 + 0x00 + 0x00 + vol);
   byte volCmd[10] = {0x7E, 0xFF, 0x06, 0x06, 0x00, 0x00, vol, (byte)(sum >> 8), (byte)(sum & 0xFF), 0xEF};
@@ -117,6 +165,7 @@ void setup() {
   v_mode = prefs.getInt("vMode", 1); target_alt = prefs.getFloat("tgtAlt", 10000.0); target_vs = prefs.getFloat("tgtVs", 1000.0);
   en_hdg = prefs.getBool("enHdg", true); target_hdg = prefs.getFloat("tgtHdg", 360.0);
   audio_volume = prefs.getInt("vol", 20); 
+  audio_style = prefs.getInt("aStyle", 0); 
 
   pfdSprite.createSprite(130, 260); spdSprite.createSprite(45, 260);
   altSprite.createSprite(65, 260); hdgSprite.createSprite(130, 30); 
@@ -124,25 +173,20 @@ void setup() {
   altSprite.setSwapBytes(true); hdgSprite.setSwapBytes(true);
 
   pinMode(25, INPUT_PULLUP); pinMode(26, INPUT_PULLUP); pinMode(33, INPUT_PULLUP); 
+  
+  // 🎙️ 设置引脚 32 监听 DFPlayer 的 BUSY 信号
+  pinMode(DF_BUSY_PIN, INPUT_PULLUP); 
+
   attachInterrupt(digitalPinToInterrupt(25), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(26), encoderISR, CHANGE); 
   attachInterrupt(digitalPinToInterrupt(33), buttonISR, FALLING);
 
   Wire.begin(21, 22);
   GPS_Serial.begin(9600, SERIAL_8N1, 16, 17);
-  GPS_Serial.write(UBLOX_5HZ, sizeof(UBLOX_5HZ)); 
   Audio_Serial.begin(9600, SERIAL_8N1, 14, 27); 
 
-  delay(500); setAudioVolume(audio_volume);
-}
-
-void drawRotatedLine(int cx, int cy, float pitch_y, float roll_rad, float x_off, float y_off, float dx, float dy, uint16_t color) {
-    float cosR = cos(roll_rad), sinR = sin(roll_rad);
-    float sx1 = x_off, sy1 = pitch_y + y_off;
-    int rx1 = cx + (sx1 * cosR - sy1 * sinR), ry1 = cy + (sx1 * sinR + sy1 * cosR);
-    float sx2 = x_off + dx, sy2 = pitch_y + y_off + dy;
-    int rx2 = cx + (sx2 * cosR - sy2 * sinR), ry2 = cy + (sx2 * sinR + sy2 * cosR);
-    pfdSprite.drawLine(rx1, ry1, rx2, ry2, color);
+  delay(1500); 
+  setAudioVolume(audio_volume);
 }
 
 void runSystemPOST() {
@@ -184,10 +228,7 @@ void runSystemPOST() {
 void drawAttitudeIndicator() {
   int cx = 65, cy = 130;
   float pitch_offset = sim_pitch * 4.0; 
-  
-  // 【核心修正】：反转渲染层的旋转角，修复姿态仪视觉悖论
   float roll_rad = -sim_roll * PI / 180.0; 
-  
   float cosR = cos(roll_rad); float sinR = sin(roll_rad);
 
   pfdSprite.fillSprite(A_SKY); 
@@ -248,11 +289,15 @@ void drawAttitudeIndicator() {
   
   pfdSprite.setTextSize(2); 
   if (!bno_alive) {
-    pfdSprite.fillRect(cx - 50, cy - 8, 100, 16, A_BLACK); pfdSprite.setTextColor(A_RED); pfdSprite.drawString("IMU FAULT", cx, cy);
+    pfdSprite.fillRect(cx - 50, cy - 8, 100, 16, A_BLACK); 
+    pfdSprite.setTextColor(A_RED); pfdSprite.drawString("IMU FAULT", cx, cy);
   } else {
-    if (faults[2]) { pfdSprite.fillRect(cx - 36, cy - 68, 72, 16, A_BLACK); pfdSprite.setTextColor(A_RED); pfdSprite.drawString("STALL", cx, cy - 60); }
-    if (faults[0]) { pfdSprite.fillRect(cx - 48, cy + 42, 96, 16, A_BLACK); pfdSprite.setTextColor(A_RED); pfdSprite.drawString("PULL UP", cx, cy + 50); } 
-    else if (faults[1]) { pfdSprite.fillRect(cx - 60, cy + 42, 120, 16, A_BLACK); pfdSprite.setTextColor(A_RED); pfdSprite.drawString("TERR AHEAD", cx, cy + 50); }
+    if (current_playing_idx != -1 && warnings[current_playing_idx].show_on_pfd) {
+      int tw = pfdSprite.textWidth(warnings[current_playing_idx].pfd_text);
+      pfdSprite.fillRect(cx - tw/2 - 4, cy + 45, tw + 8, 20, A_BLACK);
+      pfdSprite.setTextColor(warnings[current_playing_idx].pfd_color);
+      pfdSprite.drawString(warnings[current_playing_idx].pfd_text, cx, cy + 55);
+    }
   }
   pfdSprite.pushSprite(45, 30); 
 }
@@ -261,9 +306,14 @@ void drawSpeedTape() {
   spdSprite.fillSprite(A_BLACK); spdSprite.drawFastVLine(44, 0, 260, A_WHITE); 
   int spd = (int)sim_speed;
   
-  if (faults[3]) { 
-    int vmax_y = 130 - (sim_speed + 5 - sim_speed) * 3.0; 
+  if (warnings[4].active) { 
+    int vmax_y = 130 - 30; 
     for (int y = 0; y < vmax_y; y += 10) { spdSprite.fillRect(40, y, 4, 5, A_RED); spdSprite.fillRect(40, y+5, 4, 5, A_BLACK); }
+  }
+
+  if (warnings[7].active) { 
+    int vmin_y = 130 + 30; 
+    for (int y = vmin_y; y < 260; y += 10) { spdSprite.fillRect(40, y, 4, 5, A_RED); spdSprite.fillRect(40, y+5, 4, 5, A_BLACK); }
   }
   
   if (!gps.speed.isValid() || gps.speed.age() > 3000) {
@@ -402,8 +452,7 @@ void drawMenuOverlay() {
     forceRedraw = false; needsTextRedraw = true;
   }
 
-  // 17 项完美对齐菜单
-  int total_items = (currentState == MENU_FAULTS) ? 5 : 17; 
+  int total_items = (currentState == MENU_FAULTS) ? (NUM_WARNINGS + 1) : 18; 
   
   if (currentState != MENU_EDIT) {
     int newSelection = ((encoderPos % total_items) + total_items) % total_items; 
@@ -421,20 +470,20 @@ void drawMenuOverlay() {
     tft.fillRect(36, 100, 168, 148, A_GREY);
 
     if (currentState == MENU_FAULTS) {
-      String fItems[5] = {
-        String("1. PULL UP: ") + (faults[0] ? "ON " : "OFF"),
-        String("2. TERRAIN: ") + (faults[1] ? "ON " : "OFF"),
-        String("3. STALL  : ") + (faults[2] ? "ON " : "OFF"),
-        String("4. OVSPEED: ") + (faults[3] ? "ON " : "OFF"),
-        "Back to Main"
-      };
+      String fItems[NUM_WARNINGS + 1];
+      for(int i = 0; i < NUM_WARNINGS; i++) {
+        char buf[20]; sprintf(buf, "%2d.%-9s:%s", i+1, warnings[i].menu_name, warnings[i].active ? "ON" : "OFF");
+        fItems[i] = String(buf);
+      }
+      fItems[NUM_WARNINGS] = "Back to Main";
+
       for(int i = 0; i < MAX_VISIBLE_ITEMS && (i + menuScrollOffset) < total_items; i++) {
         int actual_idx = i + menuScrollOffset;
         if(actual_idx == currentMenuSelection) tft.setTextColor(A_BLACK, A_CYAN); else tft.setTextColor(A_WHITE, A_GREY); 
-        tft.drawString(fItems[actual_idx], 45, 110 + i * 22);
+        tft.drawString(fItems[actual_idx], 40, 110 + i * 22);
       }
     } else {
-      String menuItems[17];
+      String menuItems[18];
       menuItems[0] = String("Spd Tgt: ") + (en_spd ? "ON " : "OFF");
       menuItems[1] = "Spd Val: " + String((int)target_spd);
       menuItems[2] = String("V-Mode : ") + (v_mode == 1 ? "ALT" : (v_mode == 2 ? "V/S" : "OFF"));
@@ -445,13 +494,14 @@ void drawMenuOverlay() {
       menuItems[7] = "QNH: " + String((int)baro_ref);
       menuItems[8] = String("Src: ") + (use_gps_alt ? "GPS" : "BARO");
       menuItems[9] = "Volume : " + String(audio_volume);
-      menuItems[10] = "Align Axes >"; 
-      menuItems[11] = String("Inv HDG: ") + (inv_hdg ? "ON " : "OFF");
-      menuItems[12] = "Zero Ptc/Rol"; 
-      menuItems[13] = "Zero HDG"; 
-      menuItems[14] = "Reset All"; 
-      menuItems[15] = "Warnings... >"; 
-      menuItems[16] = "Exit"; // 完美归位！
+      menuItems[10] = String("A.Style: ") + (audio_style == 0 ? "AIRBUS" : "BOEING"); 
+      menuItems[11] = "Align Axes >"; 
+      menuItems[12] = String("Inv HDG: ") + (inv_hdg ? "ON " : "OFF");
+      menuItems[13] = "Zero Ptc/Rol"; 
+      menuItems[14] = "Zero HDG"; 
+      menuItems[15] = "Reset All"; 
+      menuItems[16] = "Warnings... >"; 
+      menuItems[17] = "Exit"; 
 
       for(int i = 0; i < MAX_VISIBLE_ITEMS && (i + menuScrollOffset) < total_items; i++) {
         int actual_idx = i + menuScrollOffset;
@@ -546,6 +596,72 @@ void loop() {
   if (millis() - lastUpdate > 30) {
     lastUpdate = millis();
 
+    // ==========================================
+    // 🌟 基于硬件反馈 (BUSY 引脚) 的完美调度器
+    // ==========================================
+    // 读取 BUSY 引脚状态：LOW(0) 表示正在播放，HIGH(1) 表示闲置
+    bool is_busy = (digitalRead(DF_BUSY_PIN) == LOW); 
+
+    int highest_active_level = 99; 
+    for (int i = 0; i < NUM_WARNINGS; i++) {
+      if (warnings[i].active && warnings[i].level < highest_active_level) {
+        highest_active_level = warnings[i].level;
+      }
+    }
+
+    int active_indices[NUM_WARNINGS];
+    int active_count = 0;
+    if (highest_active_level != 99) {
+      for (int i = 0; i < NUM_WARNINGS; i++) {
+        if (warnings[i].active && warnings[i].level == highest_active_level) {
+          active_indices[active_count++] = i;
+        }
+      }
+    }
+
+    if (active_count > 0) {
+      bool preempt = (highest_active_level < last_played_level);
+      
+      // 遭遇更高级别警报，立刻重置状态打断！
+      if (preempt) {
+        stopAudio();
+        audio_state = A_IDLE; 
+        current_round_robin_idx = 0;
+      }
+      
+      // 状态机流转：如果在播放中，但引脚变高了（且避开指令下发初期的 300 毫秒盲区）
+      if (audio_state == A_PLAYING) {
+        if (!is_busy && (millis() - play_start_time > 300)) {
+          audio_state = A_WAITING;
+          wait_start_time = millis(); // 开启 1 秒倒数！
+        }
+      }
+      
+      // 满足条件就开火：刚开始响(IDLE)，或者刚沉默了整整 1 秒钟(WAITING)
+      if (audio_state == A_IDLE || (audio_state == A_WAITING && (millis() - wait_start_time >= 1000))) {
+        if (current_round_robin_idx >= active_count) current_round_robin_idx = 0;
+        
+        int warning_to_play = active_indices[current_round_robin_idx];
+        playWarningAudio(warnings[warning_to_play].track_id);
+        
+        audio_state = A_PLAYING;
+        play_start_time = millis();
+        last_played_level = highest_active_level;
+        current_playing_idx = warning_to_play; 
+        
+        current_round_robin_idx++; 
+      }
+    } else {
+      // 警报解除
+      if (last_played_level != 99) {
+        stopAudio();
+        last_played_level = 99;
+        current_playing_idx = -1; 
+        audio_state = A_IDLE;
+      }
+    }
+    // ==========================================
+
     if (millis() - lastTrendTime >= 200) {
       float dt_sec = (millis() - lastTrendTime) / 1000.0;
       float instant_accel = (sim_speed - last_trend_speed) / dt_sec; 
@@ -559,7 +675,6 @@ void loop() {
     }
 
     if (bno_alive) {
-      // 1. 提取物理重力矢量并投影至定义的机身框架
       imu::Vector<3> raw_g = bno.getVector(Adafruit_BNO055::VECTOR_GRAVITY);
       float phys_g[3] = {raw_g.x(), raw_g.y(), raw_g.z()};
       float gx = phys_g[mapX] * sgnX; float gy = phys_g[mapY] * sgnY; float gz = phys_g[mapZ] * sgnZ;
@@ -569,31 +684,24 @@ void loop() {
         raw_roll = atan2(gx, -gz) * 180.0 / M_PI;
       }
 
-      // 2. 【航向终极解法】四元数空间投影旋转！
-      // 让虚拟磁罗盘永远只附着在飞机的“机鼻”上，彻底免疫偏滚！
       imu::Quaternion q = bno.getQuat();
       float qw = q.w(), qx = q.x(), qy = q.y(), qz = q.z();
       
-      // 提取真正的飞机机鼻 (Y轴) 物理指向向量
-      // 修正：由于 Pitch 算法隐式将 mapped Y 定义为机尾，真正的机鼻向量需要反转 (-sgnY)
       float vx = 0, vy = 0, vz = 0;
       if (mapY == 0) vx = -sgnY; else if (mapY == 1) vy = -sgnY; else if (mapY == 2) vz = -sgnY;
       
-      // 将机鼻向量旋转至真实地球坐标系 (Quaternion Vector Rotation)
       float tx = 2.0 * (qy * vz - qz * vy);
       float ty = 2.0 * (qz * vx - qx * vz);
       float tz = 2.0 * (qx * vy - qy * vx);
-      float ex = vx + qw * tx + (qy * tz - qz * ty); // 地球 X (东西)
-      float ey = vy + qw * ty + (qz * tx - qx * tz); // 地球 Y (南北)
+      float ex = vx + qw * tx + (qy * tz - qz * ty); 
+      float ey = vy + qw * ty + (qz * tx - qx * tz); 
       
-      // 算出极其完美的物理航向角
       raw_heading = atan2(ex, ey) * 180.0 / M_PI;
       if (inv_hdg) raw_heading = 360.0 - raw_heading; 
 
       sim_pitch = raw_pitch - pitch_cal; 
       sim_roll = raw_roll - roll_cal;
       
-      // 越过天顶时的姿态球折叠
       if (sim_pitch > 90.0) { sim_pitch = 180.0 - sim_pitch; sim_roll += 180.0; } 
       else if (sim_pitch < -90.0) { sim_pitch = -180.0 - sim_pitch; sim_roll += 180.0; }
       while (sim_roll > 180.0) sim_roll -= 360.0;
@@ -644,7 +752,7 @@ void loop() {
       drawMenuOverlay();
       if (buttonPressed) { 
         buttonPressed = false; 
-        if(currentMenuSelection == 16) { currentState = PFD_NORMAL; forceRedraw = true; } // Exit 功能回归
+        if(currentMenuSelection == 17) { currentState = PFD_NORMAL; forceRedraw = true; } 
         else if(currentMenuSelection == 0) { en_spd = !en_spd; prefs.putBool("enSpd", en_spd); lastMenuSelection = -1; }
         else if(currentMenuSelection == 1) { currentState = MENU_EDIT; savedMenuPos = encoderPos; encoderPos = target_spd; lastMenuEncoderPos = -999; }
         else if(currentMenuSelection == 2) { v_mode = (v_mode + 1) % 3; prefs.putInt("vMode", v_mode); lastMenuSelection = -1; }
@@ -655,35 +763,39 @@ void loop() {
         else if(currentMenuSelection == 7) { currentState = MENU_EDIT; savedMenuPos = encoderPos; encoderPos = baro_ref; lastMenuEncoderPos = -999; }
         else if(currentMenuSelection == 8) { use_gps_alt = !use_gps_alt; prefs.putBool("gpsAlt", use_gps_alt); lastMenuSelection = -1; }
         else if(currentMenuSelection == 9) { currentState = MENU_EDIT; savedMenuPos = encoderPos; encoderPos = audio_volume; lastMenuEncoderPos = -999; }
-        else if(currentMenuSelection == 10) { currentState = CAL_STEP_1; forceRedraw = true; } 
-        else if(currentMenuSelection == 11) { inv_hdg = !inv_hdg; prefs.putBool("invH", inv_hdg); lastMenuSelection = -1; }
-        else if(currentMenuSelection == 12) { pitch_cal = raw_pitch; roll_cal = raw_roll; prefs.putFloat("pCal", pitch_cal); prefs.putFloat("rCal", roll_cal); currentState = PFD_NORMAL; forceRedraw = true; }
-        else if(currentMenuSelection == 13) { hdg_cal = raw_heading; prefs.putFloat("hCal", hdg_cal); currentState = PFD_NORMAL; forceRedraw = true; }
-        else if(currentMenuSelection == 14) { 
+        else if(currentMenuSelection == 10) { audio_style = (audio_style + 1) % 2; prefs.putInt("aStyle", audio_style); lastMenuSelection = -1; } 
+        else if(currentMenuSelection == 11) { currentState = CAL_STEP_1; forceRedraw = true; } 
+        else if(currentMenuSelection == 12) { inv_hdg = !inv_hdg; prefs.putBool("invH", inv_hdg); lastMenuSelection = -1; }
+        else if(currentMenuSelection == 13) { pitch_cal = raw_pitch; roll_cal = raw_roll; prefs.putFloat("pCal", pitch_cal); prefs.putFloat("rCal", roll_cal); currentState = PFD_NORMAL; forceRedraw = true; }
+        else if(currentMenuSelection == 14) { hdg_cal = raw_heading; prefs.putFloat("hCal", hdg_cal); currentState = PFD_NORMAL; forceRedraw = true; }
+        else if(currentMenuSelection == 15) { 
           pitch_cal = 0.0; roll_cal = 0.0; hdg_cal = 0.0; 
           mapX = 0; sgnX = 1; mapY = 1; sgnY = 1; mapZ = 2; sgnZ = 1; inv_hdg = false;
           baro_ref = 1013.0; use_gps_alt = false;
           en_spd = true; target_spd = 250.0; v_mode = 1; target_alt = 10000.0; target_vs = 1000.0; en_hdg = true; target_hdg = 360.0;
-          audio_volume = 20; 
+          audio_volume = 20; audio_style = 0;
           
           prefs.putFloat("pCal", 0.0); prefs.putFloat("rCal", 0.0); prefs.putFloat("hCal", 0.0);
           prefs.putInt("mapX", 0); prefs.putInt("sgnX", 1); prefs.putInt("mapY", 1); prefs.putInt("sgnY", 1); prefs.putInt("mapZ", 2); prefs.putInt("sgnZ", 1);
           prefs.putBool("invH", false); prefs.putFloat("qnh", 1013.0); prefs.putBool("gpsAlt", false);
           prefs.putBool("enSpd", true); prefs.putFloat("tgtSpd", 250.0);
           prefs.putInt("vMode", 1); prefs.putFloat("tgtAlt", 10000.0); prefs.putFloat("tgtVs", 1000.0);
-          prefs.putBool("enHdg", true); prefs.putFloat("tgtHdg", 360.0); prefs.putInt("vol", 20);
+          prefs.putBool("enHdg", true); prefs.putFloat("tgtHdg", 360.0); prefs.putInt("vol", 20); prefs.putInt("aStyle", 0);
           
           setAudioVolume(20); currentState = PFD_NORMAL; forceRedraw = true; 
         }
-        else if(currentMenuSelection == 15) { currentState = MENU_FAULTS; encoderPos = 0; menuScrollOffset = 0; forceRedraw = true; }
+        else if(currentMenuSelection == 16) { currentState = MENU_FAULTS; encoderPos = 0; menuScrollOffset = 0; forceRedraw = true; }
       }
     }
     else if (currentState == MENU_FAULTS) {
       drawMenuOverlay();
       if (buttonPressed) {
         buttonPressed = false;
-        if(currentMenuSelection == 4) { currentState = MENU_ACTIVE; encoderPos = 15; menuScrollOffset = 10; forceRedraw = true; } 
-        else { faults[currentMenuSelection] = !faults[currentMenuSelection]; if (faults[currentMenuSelection]) playWarningAudio(currentMenuSelection + 1); lastMenuSelection = -1; }
+        if(currentMenuSelection == NUM_WARNINGS) { currentState = MENU_ACTIVE; encoderPos = 16; menuScrollOffset = 11; forceRedraw = true; } 
+        else { 
+          warnings[currentMenuSelection].active = !warnings[currentMenuSelection].active; 
+          lastMenuSelection = -1; 
+        }
       }
     }
     else if (currentState == MENU_EDIT) {
