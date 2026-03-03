@@ -41,6 +41,7 @@ A Primary Flight Display simulator based on ESP32
 ||VCC|5V|建议接 5V，否则推不动喇叭且底噪大。|
 ||GND|GND|共地|
 ||SPK1 / SPK2|外接喇叭|直接连接微型扬声器的正负极。|
+||BUSY|GPIO 32|回报音频是否完成播放，作为播放下一条的依据。|
 
 ### 交互组件
 |模块|模块引脚|ESP32 引脚|备注说明|
